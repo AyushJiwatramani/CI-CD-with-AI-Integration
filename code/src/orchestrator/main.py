@@ -1,16 +1,57 @@
 # code/src/orchestrator/main.py
-from fastapi import FastAPI, Request, Header, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
+"""FastAPI orchestrator - robust imports for local runs.
+
+This file ensures the local 'code/src' folder is on sys.path so that imports like
+`from analyzer.static import ...` work when running uvicorn from repo root.
+
+Recommended to use this during development / hackathon.
+"""
+from __future__ import annotations
+
 import os
+import sys
 import logging
 
-from analyzer.static import get_impacted_modules, map_files_to_modules
+# ---------------------------
+# Ensure repo 'src' is on sys.path
+# ---------------------------
+# file is: <repo-root>/code/src/orchestrator/main.py
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+# src_dir -> <repo-root>/code/src
+_src_dir = os.path.abspath(os.path.join(_this_dir, ".."))
+if _src_dir not in sys.path:
+    # Insert at front so local packages are preferred during development.
+    sys.path.insert(0, _src_dir)
+
+# Now imports that expect 'analyzer' to be a top-level package will work.
+try:
+    from analyzer.static import get_impacted_modules, map_files_to_modules
+except Exception as exc:
+    # Provide a friendly error with debugging tips.
+    msg = (
+        "Failed to import 'analyzer' package. This usually means Python's import path "
+        "doesn't include the 'code/src' directory.\n\n"
+        f"sys.path (first 10 entries): {sys.path[:10]!r}\n\n"
+        "Quick fixes:\n"
+        " - Run uvicorn from repo root and use the patched main.py (this file adds code/src to sys.path),\n"
+        " - OR set PYTHONPATH=code/src and run `uvicorn orchestrator.main:app --reload`,\n"
+        " - OR add __init__.py files to create packages (code/, code/src/, code/src/analyzer/, code/src/orchestrator/).\n\n"
+        "Original import error: "
+    )
+    raise ImportError(msg) from exc
+
+# ---------------------------
+# FastAPI app
+# ---------------------------
+from fastapi import FastAPI, Request, Header, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
 logger = logging.getLogger("orchestrator")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Impact-Orchestrator", version="0.1.0")
+
 
 DEFAULT_REPO_ROOT = os.environ.get("REPO_ROOT", ".")
 DEFAULT_SRC_ROOTS = ["src", "packages", "lib"]
@@ -43,11 +84,6 @@ async def health():
 
 @app.post("/predict-impact", response_model=PredictResponse)
 async def predict_impact(req: PredictRequest):
-    """
-    Accept either:
-    - JSON body with "changed_files": [ ... ]
-    - A GitHub-style webhook body may be posted to /webhook (here we only accept explicit changed_files)
-    """
     repo_root = req.repo_root or DEFAULT_REPO_ROOT
     group_depth = req.group_depth if req.group_depth is not None else 2
     max_hops = req.max_hops if req.max_hops is not None else 1
@@ -55,13 +91,10 @@ async def predict_impact(req: PredictRequest):
     if not req.changed_files or not isinstance(req.changed_files, list) or len(req.changed_files) == 0:
         raise HTTPException(status_code=400, detail="Please provide non-empty 'changed_files' list in body.")
 
-    # defensive: clean inputs
     changed_files = [str(x).strip() for x in req.changed_files if isinstance(x, str) and x.strip()]
-
     if not changed_files:
         raise HTTPException(status_code=400, detail="No valid file paths found in 'changed_files' list.")
 
-    # compute impacted modules via analyzer
     try:
         preds = get_impacted_modules(
             changed_files=changed_files,
@@ -74,10 +107,8 @@ async def predict_impact(req: PredictRequest):
         logger.exception("Error computing impact: %s", e)
         raise HTTPException(status_code=500, detail="Internal error computing impact.")
 
-    # recommended jobs -> simple "unit:<module>" naming
     recommended_jobs = [f"unit:{p['component']}" for p in preds]
 
-    # Build response
     response = {
         "predictions": preds,
         "recommended_jobs": recommended_jobs,
@@ -87,17 +118,11 @@ async def predict_impact(req: PredictRequest):
 
 @app.post("/webhook")
 async def webhook_handler(request: Request, x_github_event: Optional[str] = Header(None)):
-    """
-    Generic webhook receiver.
-    If the webhook body contains a 'changed_files' list (e.g., from a proxy that resolves files),
-    we will process it. Otherwise we return 202 Accepted and instructions.
-    """
     try:
         payload = await request.json()
     except Exception:
         payload = None
 
-    # If user posts a payload with changed_files, delegate to predict-impact logic
     if payload and isinstance(payload, dict) and "changed_files" in payload:
         try:
             body = PredictRequest(**{"changed_files": payload["changed_files"]})
@@ -106,13 +131,10 @@ async def webhook_handler(request: Request, x_github_event: Optional[str] = Head
             logger.exception("Webhook -> predict error: %s", e)
             raise HTTPException(status_code=400, detail="Invalid webhook payload for changed_files.")
     else:
-        # We cannot fetch changed files from a raw GitHub webhook without calling GH APIs.
-        # So we accept the event and tell the user how to follow-up:
         hint = {
             "message": "Received webhook.",
             "event": x_github_event,
             "note": "This endpoint will process webhooks that include a 'changed_files' array. "
-            "For GitHub pull_request webhooks that don't include file lists, you must either call /predict-impact with changed_files, "
-            "or implement a GitHub App / script that fetches PR file list and posts it here.",
+            "For GitHub pull_request webhooks that don't include file lists, fetch PR files via GitHub API and call /predict-impact.",
         }
         return hint
