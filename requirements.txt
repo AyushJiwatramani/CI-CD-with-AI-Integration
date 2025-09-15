@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+requests
+scikit-learn
+pandas
+networkx
+python-dotenv
